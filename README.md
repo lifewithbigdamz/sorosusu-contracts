@@ -3,7 +3,7 @@
 A trustless Rotating Savings and Credit Association (ROSCA) built on Stellar Soroban.
 
 ## Deployed Contract
-- **Network:** Stellar Testnet
+- **Network:** Stellar Mainnet
 - **Contract ID:** CAH65U2KXQ34G7AT7QMWP6WUFYWAV6RPJRSDOB4KID6TP3OORS3BQHCX
 
 ## Features
