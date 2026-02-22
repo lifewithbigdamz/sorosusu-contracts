@@ -1,7 +1,7 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, Address, Env, Vec,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, Env, Vec,
 };
 
 const MAX_MEMBERS: u32 = 50;
@@ -21,6 +21,11 @@ pub struct Circle {
     members: Vec<Address>,
     is_random_queue: bool,
     payout_queue: Vec<Address>,
+    has_received_payout: Vec<bool>,
+    current_payout_index: u32,
+    total_volume_distributed: i128,
+    cycle_number: u32,
+    token: Option<Address>,
 }
 
 #[derive(Clone)]
@@ -37,6 +42,13 @@ pub struct GroupRolloverEvent {
     new_cycle_number: u32,
 }
 
+#[derive(Clone)]
+#[contracttype]
+pub struct LateJoinerCaughtUpEvent {
+    member_address: Address,
+    amount_paid: i128,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[contracterror]
 pub enum Error {
@@ -47,6 +59,7 @@ pub enum Error {
     Unauthorized = 1005,
     MaxMembersReached = 1006,
     CircleNotFinalized = 1007,
+    LateJoinRequiresToken = 1008,
 }
 
 #[contract]
@@ -78,17 +91,28 @@ fn next_circle_id(env: &Env) -> u32 {
 
 #[contractimpl]
 impl SoroSusu {
-    pub fn create_circle(env: Env, contribution: i128, is_random_queue: bool) -> u32 {
+    pub fn create_circle(
+        env: Env,
+        contribution: i128,
+        is_random_queue: bool,
+        token: Option<Address>,
+    ) -> u32 {
         let admin = env.invoker();
         let id = next_circle_id(&env);
         let members = Vec::new(&env);
         let payout_queue = Vec::new(&env);
+        let has_received_payout = Vec::new(&env);
         let circle = Circle {
             admin,
             contribution,
             members,
             is_random_queue,
             payout_queue,
+            has_received_payout,
+            current_payout_index: 0,
+            total_volume_distributed: 0,
+            cycle_number: 0,
+            token,
         };
         write_circle(&env, id, &circle);
         id
@@ -106,6 +130,31 @@ impl SoroSusu {
         if member_count >= MAX_MEMBERS {
             panic_with_error!(&env, Error::MaxMembersReached);
         }
+
+        // Catch-up for late joiners: group has already started when payout_queue is set and we're in a cycle
+        let elapsed_rounds = circle.cycle_number;
+        if elapsed_rounds > 0 {
+            let amount_paid = circle.contribution
+                * (i128::from(elapsed_rounds) + 1);
+            match &circle.token {
+                Some(token_address) => {
+                    let token_client = token::Client::new(&env, token_address);
+                    token_client.transfer_from(
+                        &env,
+                        &invoker,
+                        &env.current_contract_address(),
+                        &amount_paid,
+                    );
+                }
+                None => panic_with_error!(&env, Error::LateJoinRequiresToken),
+            }
+            let event = LateJoinerCaughtUpEvent {
+                member_address: invoker.clone(),
+                amount_paid,
+            };
+            event::publish(&env, symbol_short!("LATE_JOIN_CAUGHT_UP"), &event);
+        }
+
         circle.members.push_back(invoker);
         circle.has_received_payout.push_back(false);
         write_circle(&env, circle_id, &circle);
@@ -227,6 +276,8 @@ impl SoroSusu {
     pub fn get_payout_queue(env: Env, circle_id: u32) -> Vec<Address> {
         let circle = read_circle(&env, circle_id);
         circle.payout_queue
+    }
+
     pub fn get_cycle_info(env: Env, circle_id: u32) -> (u32, u32, i128) {
         let circle = read_circle(&env, circle_id);
         (
@@ -255,7 +306,7 @@ mod test {
         let contract_id = env.register_contract(None, SoroSusu);
         let client = SoroSusuClient::new(&env, &contract_id);
         let contribution = 10_i128;
-        let circle_id = client.create_circle(&contribution, &false);
+        let circle_id = client.create_circle(&contribution, &false, None);
 
         for _ in 0..MAX_MEMBERS {
             let member = Address::generate(&env);
@@ -277,7 +328,7 @@ mod test {
         let contribution = 10_i128;
 
         // Create circle with random queue enabled
-        let circle_id = client.create_circle(&contribution, &true);
+        let circle_id = client.create_circle(&contribution, &true, None);
 
         // Add some members
         let members: Vec<Address> = (0..5).map(|_| Address::generate(&env)).collect();
@@ -288,7 +339,7 @@ mod test {
         let contribution = 100_i128;
 
         // Create circle and add members
-        let circle_id = client.create_circle(&contribution);
+        let circle_id = client.create_circle(&contribution, &false, None);
         let members: Vec<Address> = (0..3).map(|_| Address::generate(&env)).collect();
 
         for member in &members {
@@ -318,7 +369,7 @@ mod test {
         let contribution = 10_i128;
 
         // Create circle with random queue disabled
-        let circle_id = client.create_circle(&contribution, &false);
+        let circle_id = client.create_circle(&contribution, &false, None);
 
         // Add some members in a specific order
         let members: Vec<Address> = (0..5).map(|_| Address::generate(&env)).collect();
@@ -349,7 +400,7 @@ mod test {
         let contribution = 50_i128;
 
         // Create circle and add members
-        let circle_id = client.create_circle(&contribution);
+        let circle_id = client.create_circle(&contribution, &false, None);
         let members: Vec<Address> = (0..2).map(|_| Address::generate(&env)).collect();
 
         for member in &members {
@@ -403,10 +454,10 @@ mod test {
         let client = SoroSusuClient::new(&env, &contract_id);
         let contribution = 10_i128;
 
-        let circle_id = client.create_circle(&contribution, &true);
+        let circle_id = client.create_circle(&contribution, &true, None);
 
         // Try to finalize with non-admin
-        let circle_id = client.create_circle(&contribution);
+        let circle_id = client.create_circle(&contribution, &false, None);
         let member = Address::generate(&env);
         client.join_circle(&circle_id);
 
@@ -428,7 +479,7 @@ mod test {
         let client = SoroSusuClient::new(&env, &contract_id);
         let contribution = 10_i128;
 
-        let circle_id = client.create_circle(&contribution);
+        let circle_id = client.create_circle(&contribution, &false, None);
         let member = Address::generate(&env);
         client.join_circle(&circle_id);
 
@@ -446,7 +497,7 @@ mod test {
         let client = SoroSusuClient::new(&env, &contract_id);
         let contribution = 10_i128;
 
-        let circle_id = client.create_circle(&contribution);
+        let circle_id = client.create_circle(&contribution, &false, None);
         let member = Address::generate(&env);
         client.join_circle(&circle_id);
 
