@@ -40,7 +40,7 @@ pub struct GroupRolloverEvent {
     new_cycle_number: u32,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[contracterror]
 pub enum Error {
     CycleNotComplete = 1001,
@@ -49,6 +49,7 @@ pub enum Error {
     CircleNotFound = 1004,
     Unauthorized = 1005,
     MaxMembersReached = 1006,
+    CircleNotFinalized = 1007,
 }
 
 #[contract]
@@ -80,7 +81,7 @@ fn next_circle_id(env: &Env) -> u32 {
 
 #[contractimpl]
 impl SoroSusu {
-    pub fn create_circle(env: Env, contribution: i128) -> u32 {
+    pub fn create_circle(env: Env, contribution: i128, is_random_queue: bool) -> u32 {
         let admin = env.invoker();
         let id = next_circle_id(&env);
         let members = Vec::new(&env);
@@ -230,7 +231,7 @@ mod test {
         let contract_id = env.register_contract(None, SoroSusu);
         let client = SoroSusuClient::new(&env, &contract_id);
         let contribution = 10_i128;
-        let circle_id = client.create_circle(&contribution);
+        let circle_id = client.create_circle(&contribution, &false);
 
         for _ in 0..MAX_MEMBERS {
             let member = Address::generate(&env);
