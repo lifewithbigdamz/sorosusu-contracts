@@ -1,8 +1,7 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, event, panic_with_error, symbol_short,
-    Address, Env, Vec,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, Address, Env, Vec,
 };
 
 const MAX_MEMBERS: u32 = 50;
@@ -20,10 +19,8 @@ pub struct Circle {
     admin: Address,
     contribution: i128,
     members: Vec<Address>,
-    cycle_number: u32,
-    current_payout_index: u32,
-    has_received_payout: Vec<bool>,
-    total_volume_distributed: i128,
+    is_random_queue: bool,
+    payout_queue: Vec<Address>,
 }
 
 #[derive(Clone)]
@@ -85,15 +82,13 @@ impl SoroSusu {
         let admin = env.invoker();
         let id = next_circle_id(&env);
         let members = Vec::new(&env);
-        let has_received_payout = Vec::new(&env);
+        let payout_queue = Vec::new(&env);
         let circle = Circle {
             admin,
             contribution,
             members,
-            cycle_number: 1,
-            current_payout_index: 0,
-            has_received_payout,
-            total_volume_distributed: 0,
+            is_random_queue,
+            payout_queue,
         };
         write_circle(&env, id, &circle);
         id
@@ -203,6 +198,35 @@ impl SoroSusu {
         write_circle(&env, circle_id, &circle);
     }
 
+    pub fn finalize_circle(env: Env, circle_id: u32) {
+        let mut circle = read_circle(&env, circle_id);
+
+        // Only admin can finalize the circle
+        if env.invoker() != circle.admin {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+
+        // Check if payout_queue is already finalized
+        if !circle.payout_queue.is_empty() {
+            return; // Already finalized
+        }
+
+        if circle.is_random_queue {
+            // Use Soroban's PRNG to shuffle the members
+            let mut shuffled_members = circle.members.clone();
+            env.prng().shuffle(&mut shuffled_members);
+            circle.payout_queue = shuffled_members;
+        } else {
+            // Use the order members joined
+            circle.payout_queue = circle.members.clone();
+        }
+
+        write_circle(&env, circle_id, &circle);
+    }
+
+    pub fn get_payout_queue(env: Env, circle_id: u32) -> Vec<Address> {
+        let circle = read_circle(&env, circle_id);
+        circle.payout_queue
     pub fn get_cycle_info(env: Env, circle_id: u32) -> (u32, u32, i128) {
         let circle = read_circle(&env, circle_id);
         (
@@ -246,6 +270,17 @@ mod test {
     }
 
     #[test]
+    fn test_random_queue_finalization() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, SoroSusu);
+        let client = SoroSusuClient::new(&env, &contract_id);
+        let contribution = 10_i128;
+
+        // Create circle with random queue enabled
+        let circle_id = client.create_circle(&contribution, &true);
+
+        // Add some members
+        let members: Vec<Address> = (0..5).map(|_| Address::generate(&env)).collect();
     fn test_process_payout_and_cycle_completion() {
         let env = Env::default();
         let contract_id = env.register_contract(None, SoroSusu);
@@ -260,6 +295,33 @@ mod test {
             client.join_circle(&circle_id);
         }
 
+        // Finalize the circle (admin is the creator)
+        client.finalize_circle(&circle_id);
+
+        // Get the payout queue
+        let payout_queue = client.get_payout_queue(&circle_id);
+
+        // Verify that all members are in the queue
+        assert_eq!(payout_queue.len(), 5);
+
+        // Verify that the queue contains all members (order may be different due to shuffle)
+        for member in &members {
+            assert!(payout_queue.contains(member));
+        }
+    }
+
+    #[test]
+    fn test_sequential_queue_finalization() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, SoroSusu);
+        let client = SoroSusuClient::new(&env, &contract_id);
+        let contribution = 10_i128;
+
+        // Create circle with random queue disabled
+        let circle_id = client.create_circle(&contribution, &false);
+
+        // Add some members in a specific order
+        let members: Vec<Address> = (0..5).map(|_| Address::generate(&env)).collect();
         // Process payouts for all members
         for member in &members {
             client.process_payout(&circle_id, member);
@@ -294,6 +356,21 @@ mod test {
             client.join_circle(&circle_id);
         }
 
+        // Finalize the circle (admin is the creator)
+        client.finalize_circle(&circle_id);
+
+        // Get the payout queue
+        let payout_queue = client.get_payout_queue(&circle_id);
+
+        // Verify that the queue preserves the join order
+        assert_eq!(payout_queue.len(), 5);
+        for (i, member) in members.iter().enumerate() {
+            assert_eq!(payout_queue.get(i as u32), Some(member));
+        }
+    }
+
+    #[test]
+    fn test_finalize_circle_unauthorized() {
         // Process all payouts
         for member in &members {
             client.process_payout(&circle_id, member);
@@ -326,6 +403,9 @@ mod test {
         let client = SoroSusuClient::new(&env, &contract_id);
         let contribution = 10_i128;
 
+        let circle_id = client.create_circle(&contribution, &true);
+
+        // Try to finalize with non-admin
         let circle_id = client.create_circle(&contribution);
         let member = Address::generate(&env);
         client.join_circle(&circle_id);
@@ -335,6 +415,7 @@ mod test {
         env.set_source_account(&unauthorized_user);
 
         let result = std::panic::catch_unwind(|| {
+            client.finalize_circle(&circle_id);
             client.process_payout(&circle_id, &member);
         });
         assert!(result.is_err());
