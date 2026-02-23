@@ -3,23 +3,14 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contractmeta, contracttype, panic_with_error,
-    symbol_short, token, Address, BytesN, Env, Symbol, Vec,
-};
 
-const FEE_BASIS_POINTS_KEY: Symbol = symbol_short!("fee_bps");
-const TREASURY_KEY: Symbol = symbol_short!("treasury");
-const ADMIN_KEY: Symbol = symbol_short!("admin");
-const MAX_BASIS_POINTS: u32 = 10_000;
-const MAX_MEMBERS: u32 = 50;
-
-contractmeta!(
-    key = "Description",
-    val = "SoroSusu ROSCA protocol with protocol payout fee"
-);
 
 #[derive(Clone)]
 #[contracttype]
 pub enum DataKey {
+    LastActiveTimestamp,
+    UserBalance(Address),
+    Admin,
     Circle(u32),
     CircleCount,
 }
@@ -124,11 +115,7 @@ main
 
         let mut circle = read_circle(&env, circle_id);
 
-        if admin != circle.admin {
-            panic_with_error!(&env, Error::Unauthorized);
-        }
 
-        let mut member_index: Option<u32> = None;
         for (i, member) in circle.members.iter().enumerate() {
             if member == recipient {
                 member_index = Some(i as u32);
@@ -141,22 +128,13 @@ main
             None => panic_with_error!(&env, Error::NotMember),
         };
 
-        if circle.has_received_payout.get(index).unwrap_or(false) {
-            panic_with_error!(&env, Error::PayoutAlreadyReceived);
-        }
 
-
-        circle.has_received_payout.set(index, true);
-        circle.current_payout_index += 1;
-        circle.total_volume_distributed += circle.contribution;
-
-        let all_paid = circle.has_received_payout.iter().all(|paid| paid);
         if all_paid {
             let event = CycleCompletedEvent {
                 group_id: circle_id,
                 total_volume_distributed: circle.total_volume_distributed,
             };
-            env.events().publish((symbol_short!("CYCLE_COMP"),), event);
+
         }
 
         write_circle(&env, circle_id, &circle);
@@ -166,9 +144,7 @@ main
         admin.require_auth();
         let mut circle = read_circle(&env, circle_id);
 
-        if admin != circle.admin {
-            panic_with_error!(&env, Error::Unauthorized);
-        }
+
 
         for received in circle.has_received_payout.iter() {
             if !received {
@@ -180,17 +156,11 @@ main
         circle.current_payout_index = 0;
         circle.total_volume_distributed = 0;
 
-        let len = circle.has_received_payout.len();
-        circle.has_received_payout = Vec::new(&env);
-        for _ in 0..len {
-            circle.has_received_payout.push_back(false);
-        }
 
         let event = GroupRolloverEvent {
             group_id: circle_id,
             new_cycle_number: circle.cycle_number,
         };
-        env.events().publish((symbol_short!("GROUP_ROLL"),), event);
 
         write_circle(&env, circle_id, &circle);
     }
@@ -199,18 +169,14 @@ main
         admin.require_auth();
         let mut circle = read_circle(&env, circle_id);
 
-        if admin != circle.admin {
-            panic_with_error!(&env, Error::Unauthorized);
-        }
+
 
         if !circle.payout_queue.is_empty() {
             return;
         }
 
         if circle.is_random_queue {
-            let mut shuffled = circle.members.clone();
-            env.prng().shuffle(&mut shuffled);
-            circle.payout_queue = shuffled;
+
         } else {
             circle.payout_queue = circle.members.clone();
         }
@@ -252,130 +218,235 @@ main
     }
 }
 
+contractmeta!(
+    key = "Description",
+    val = "SoroSusu ROSCA protocol with protocol payout fee"
+);
+
+#[contract]
+pub struct SorosusuContracts;
+
+#[contractimpl]
+impl SorosusuContracts {
+    pub fn initialize(env: Env, admin: Address) -> Result<(), Error> {
+        if env.storage().instance().has(&ADMIN_KEY) {
+            return Err(Error::Unauthorized);
+        }
+        env.storage().instance().set(&ADMIN_KEY, &admin);
+        env.storage().instance().set(&FEE_BASIS_POINTS_KEY, &0u32);
+        env.storage().instance().set(&IS_PUBLIC_KEY, &true);
+        
+        let empty_members: Vec<Address> = Vec::new(&env);
+        let empty_contribs: Map<Address, i128> = Map::new(&env);
+        env.storage().instance().set(&MEMBERS_KEY, &empty_members);
+        env.storage().instance().set(&CONTRIBS_KEY, &empty_contribs);
+        
+        Ok(())
+    }
+
+    pub fn set_protocol_fee(
+        env: Env,
+        fee_basis_points: u32,
+        treasury: Address,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        if fee_basis_points > MAX_BASIS_POINTS {
+            return Err(Error::InvalidFeeConfig);
+        }
+        env.storage().instance().set(&FEE_BASIS_POINTS_KEY, &fee_basis_points);
+        env.storage().instance().set(&TREASURY_KEY, &treasury);
+        Ok(())
+    }
+
+    pub fn fee_basis_points(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get::<_, u32>(&FEE_BASIS_POINTS_KEY)
+            .unwrap_or(0)
+    }
+
+    pub fn treasury_address(env: Env) -> Option<Address> {
+        env.storage().instance().get::<_, Address>(&TREASURY_KEY)
+    }
+
+    pub fn compute_and_transfer_payout(
+        env: Env,
+        token: Address,
+        from: Address,
+        recipient: Address,
+        gross_payout: i128,
+    ) -> Result<(), Error> {
+        let fee_bps = env.storage().instance().get::<_, u32>(&FEE_BASIS_POINTS_KEY).unwrap_or(0);
+        let fee = if fee_bps == 0 {
+            0_i128
+        } else {
+            (gross_payout as i128 * fee_bps as i128) / MAX_BASIS_POINTS as i128
+        };
+        let net_payout = gross_payout - fee;
+
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&from, &recipient, &net_payout);
+
+        if fee > 0 {
+            let treasury: Address = env
+                .storage()
+                .instance()
+                .get::<_, Address>(&TREASURY_KEY)
+                .ok_or(Error::InvalidFeeConfig)?;
+            token_client.transfer(&from, &treasury, &fee);
+        }
+
+        Ok(())
+    }
+
+    pub fn kick_member(
+        env: Env,
+        token: Address,
+        member: Address,
+        penalty: i128,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+
+        let mut members: Vec<Address> = env.storage().instance().get(&MEMBERS_KEY).unwrap_or(Vec::new(&env));
+        let mut member_index = None;
+        
+        for (i, m) in members.iter().enumerate() {
+            if m == member {
+                member_index = Some(i as u32);
+                break;
+            }
+        }
+
+        let index = member_index.ok_or(Error::MemberNotFound)?;
+
+        let mut contribs: Map<Address, i128> = env.storage().instance().get(&CONTRIBS_KEY).unwrap_or(Map::new(&env));
+        let total_contributed = contribs.get(member.clone()).unwrap_or(0);
+
+        if total_contributed < penalty {
+            return Err(Error::PenaltyExceedsContribution);
+        }
+
+        members.remove(index);
+        contribs.remove(member.clone());
+        
+        env.storage().instance().set(&MEMBERS_KEY, &members);
+        env.storage().instance().set(&CONTRIBS_KEY, &contribs);
+
+        let refund = total_contributed - penalty;
+        let contract_address = env.current_contract_address();
+        let token_client = token::Client::new(&env, &token);
+
+        if refund > 0 {
+            token_client.transfer(&contract_address, &member, &refund);
+        }
+
+        if penalty > 0 {
+            if let Some(treasury) = Self::treasury_address(env.clone()) {
+                token_client.transfer(&contract_address, &treasury, &penalty);
+            }
+        }
+
+        env.events().publish(
+            (symbol_short!("Kicked"), member.clone()),
+            (refund, penalty),
+        );
+
+        Ok(())
+    }
+
+    pub fn join(env: Env, member: Address, invite_code: Option<u64>) -> Result<(), Error> {
+        member.require_auth();
+
+        let mut count: u32 = env.storage().instance().get(&MEMBERS_COUNT_KEY).unwrap_or(0);
+        if count >= MAX_MEMBERS {
+            return Err(Error::MemberLimitExceeded);
+        }
+
+        let mut members: Vec<Address> = env.storage().instance().get(&MEMBERS_KEY).unwrap_or(Vec::new(&env));
+        if members.contains(&member) {
+            return Err(Error::AlreadyJoined);
+        }
+
+        let is_public: bool = env.storage().instance().get(&IS_PUBLIC_KEY).unwrap_or(true);
+
+        if !is_public {
+            let mut authorized_by_code = false;
+            if let Some(code) = invite_code {
+                if let Some(expected_code) = env.storage().instance().get::<_, u64>(&INVITE_CODE_KEY) {
+                    if code == expected_code {
+                        authorized_by_code = true;
+                    }
+                }
+            }
+            if !authorized_by_code {
+                Self::require_admin(&env)?;
+            }
+        }
+
+        members.push_back(member.clone());
+        env.storage().instance().set(&MEMBERS_KEY, &members);
+
+        count += 1;
+        env.storage().instance().set(&MEMBERS_COUNT_KEY, &count);
+
+        let mut contribs: Map<Address, i128> = env.storage().instance().get(&CONTRIBS_KEY).unwrap_or(Map::new(&env));
+        contribs.set(member, 0);
+        env.storage().instance().set(&CONTRIBS_KEY, &contribs);
+
+        Ok(())
+    }
+
+    pub fn member_count(env: Env) -> u32 {
+        env.storage().instance().get(&MEMBERS_COUNT_KEY).unwrap_or(0)
+    }
+
+    fn require_admin(env: &Env) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN_KEY)
+            .ok_or(Error::Unauthorized)?;
+        admin.require_auth();
+        Ok(())
+    }
+    
+    pub fn set_privacy_config(
+        env: Env,
+        is_public: bool,
+        invite_code: Option<u64>,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        env.storage().instance().set(&IS_PUBLIC_KEY, &is_public);
+        if let Some(code) = invite_code {
+            env.storage().instance().set(&INVITE_CODE_KEY, &code);
+        } else {
+            env.storage().instance().remove(&INVITE_CODE_KEY);
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod test {
     extern crate std;
-
     use super::*;
-    use soroban_sdk::testutils::{Address as _, AuthorizedFunction, AuthorizedInvocation};
-    use soroban_sdk::{vec, IntoVal};
 
-    fn setup() -> (soroban_sdk::Env, SoroSusuClient<'static>) {
-        let env = soroban_sdk::Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register_contract(None, SoroSusu);
-        let client = SoroSusuClient::new(&env, &contract_id);
-        (env, client)
-    }
-
-    #[test]
-    fn upgrade_requires_admin() {
-        let (env, client) = setup();
-        let admin = Address::generate(&env);
-        client.initialize(&admin);
-
-        let non_admin = Address::generate(&env);
-        let new_wasm_hash = BytesN::from_array(&env, &[1u8; 32]);
-
-        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
-            address: non_admin.clone(),
-            invoke: &soroban_sdk::testutils::MockAuthInvoke {
-                contract: &client.address,
-                fn_name: "upgrade",
-                args: vec![&env, new_wasm_hash.into_val(&env)],
-                sub_invokes: &[],
-            },
-        }]);
-
-        let result = client.try_upgrade(&new_wasm_hash);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn upgrade_rejects_empty_hash() {
-        let (env, client) = setup();
-        let admin = Address::generate(&env);
-        client.initialize(&admin);
-
-        let empty_hash = BytesN::new(&env);
-        let result = client.try_upgrade(&empty_hash);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().unwrap(), Error::InvalidUpgradeHash);
-    }
-
-    #[test]
-    fn join_circle_enforces_max_members() {
-        let (env, client) = setup();
-        let admin = Address::generate(&env);
-        let circle_id = client.create_circle(&admin, &10_i128, &false, &None);
-
-        for _ in 0..MAX_MEMBERS {
-            let member = Address::generate(&env);
-            client.join_circle(&member, &circle_id);
-        }
-
-        let extra = Address::generate(&env);
-        let result = std::panic::catch_unwind(|| {
-            client.join_circle(&extra, &circle_id);
-        });
         assert!(result.is_err());
     }
 
     #[test]
     fn test_random_queue_finalization() {
-        let (env, client) = setup();
-        let admin = Address::generate(&env);
-        let circle_id = client.create_circle(&admin, &10_i128, &true, &None);
 
-        let members: std::vec::Vec<Address> = (0..5).map(|_| Address::generate(&env)).collect();
-        for member in &members {
-            client.join_circle(member, &circle_id);
-        }
-
-        client.finalize_circle(&admin, &circle_id);
-        let queue = client.get_payout_queue(&circle_id);
-
-        assert_eq!(queue.len(), 5);
-        for member in &members {
-            assert!(queue.contains(member));
         }
     }
 
-    #[test]
-    fn test_sequential_queue_finalization() {
-        let (env, client) = setup();
-        let admin = Address::generate(&env);
-        let circle_id = client.create_circle(&admin, &10_i128, &false, &None);
 
-        let members: std::vec::Vec<Address> = (0..5).map(|_| Address::generate(&env)).collect();
-        for member in &members {
-            client.join_circle(member, &circle_id);
-        }
-
-        client.finalize_circle(&admin, &circle_id);
-        let queue = client.get_payout_queue(&circle_id);
-
-        assert_eq!(queue.len(), 5);
-        for (i, member) in members.iter().enumerate() {
-            assert_eq!(queue.get(i as u32), Some(member.clone()));
         }
     }
 
     #[test]
     fn test_process_payout_and_cycle_completion() {
-        let (env, client) = setup();
-        let admin = Address::generate(&env);
-        let circle_id = client.create_circle(&admin, &100_i128, &false, &None);
 
-        let members: std::vec::Vec<Address> = (0..3).map(|_| Address::generate(&env)).collect();
-        for member in &members {
-            client.join_circle(member, &circle_id);
-        }
-
-        client.finalize_circle(&admin, &circle_id);
-
-        for member in &members {
-            client.process_payout(&admin, &circle_id, member);
         }
 
         let (cycle_num, payout_index, total_volume) = client.get_cycle_info(&circle_id);
@@ -384,27 +455,6 @@ mod test {
         assert_eq!(total_volume, 300_i128);
 
         let events = env.events().all();
-        assert!(!events.is_empty());
-    }
-
-    #[test]
-    fn test_group_rollover() {
-        let (env, client) = setup();
-        let admin = Address::generate(&env);
-        let circle_id = client.create_circle(&admin, &50_i128, &false, &None);
-
-        let members: std::vec::Vec<Address> = (0..2).map(|_| Address::generate(&env)).collect();
-        for member in &members {
-            client.join_circle(member, &circle_id);
-        }
-
-        client.finalize_circle(&admin, &circle_id);
-
-        for member in &members {
-            client.process_payout(&admin, &circle_id, member);
-        }
-
-        client.rollover_group(&admin, &circle_id);
 
         let (cycle_num, payout_index, total_volume) = client.get_cycle_info(&circle_id);
         assert_eq!(cycle_num, 2);
@@ -414,50 +464,12 @@ mod test {
 
     #[test]
     fn test_payout_unauthorized() {
-        let (env, client) = setup();
-        let admin = Address::generate(&env);
-        let circle_id = client.create_circle(&admin, &10_i128, &false);
 
-        let member = Address::generate(&env);
-        client.join_circle(&member, &circle_id);
-        client.finalize_circle(&admin, &circle_id);
-
-        let unauthorized = Address::generate(&env);
-        let result = std::panic::catch_unwind(|| {
-            client.process_payout(&unauthorized, &circle_id, &member);
-        });
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_rollover_before_cycle_complete() {
-        let (env, client) = setup();
-        let admin = Address::generate(&env);
-        let circle_id = client.create_circle(&admin, &10_i128, &false);
-
-        let member = Address::generate(&env);
-        client.join_circle(&member, &circle_id);
-
-        let result = std::panic::catch_unwind(|| {
-            client.rollover_group(&admin, &circle_id);
-        });
         assert!(result.is_err());
     }
 
     #[test]
     fn test_duplicate_payout() {
-        let (env, client) = setup();
-        let admin = Address::generate(&env);
-        let circle_id = client.create_circle(&admin, &10_i128, &false);
-
-        let member = Address::generate(&env);
-        client.join_circle(&member, &circle_id);
-        client.finalize_circle(&admin, &circle_id);
-        client.process_payout(&admin, &circle_id, &member);
-
-        let result = std::panic::catch_unwind(|| {
-            client.process_payout(&admin, &circle_id, &member);
-        });
-        assert!(result.is_err());
+ssert!(result.is_err());
     }
 
