@@ -20,7 +20,7 @@ pub enum DataKey {
 #[derive(Clone)]
 pub struct Member {
     pub address: Address,
-    pub has_contributed: bool,
+    pub index: u32,
     pub contribution_count: u32,
     pub last_contribution_time: u64,
 }
@@ -38,6 +38,8 @@ pub struct CircleInfo {
     pub token: Address, // The token used (USDC, XLM)
     pub deadline_timestamp: u64, // Deadline for on-time payments
     pub cycle_duration: u64, // Duration of each payment cycle in seconds
+    pub contribution_bitmap: u64,
+    pub payout_bitmap: u64,
 }
 
 // --- CONTRACT TRAIT ---
@@ -79,6 +81,10 @@ impl SoroSusuTrait for SoroSusu {
         // 2. Increment the ID for the new circle
         circle_count += 1;
 
+        if max_members > 64 {
+            panic!("Max members cannot exceed 64 for optimization");
+        }
+
         // 3. Create the Circle Data Struct
         let current_time = env.ledger().timestamp();
         let new_circle = CircleInfo {
@@ -92,6 +98,8 @@ impl SoroSusuTrait for SoroSusu {
             token,
             deadline_timestamp: current_time + cycle_duration,
             cycle_duration,
+            contribution_bitmap: 0,
+            payout_bitmap: 0,
         };
 
         // 4. Save the Circle and the new Count
@@ -128,7 +136,7 @@ impl SoroSusuTrait for SoroSusu {
         // 5. Create and store the new member
         let new_member = Member {
             address: user.clone(),
-            has_contributed: false,
+            index: circle.member_count as u32,
             contribution_count: 0,
             last_contribution_time: 0,
         };
@@ -178,7 +186,6 @@ impl SoroSusuTrait for SoroSusu {
         );
 
         // 7. Update member contribution info
-        member.has_contributed = true;
         member.contribution_count += 1;
         member.last_contribution_time = current_time;
         
@@ -187,10 +194,8 @@ impl SoroSusuTrait for SoroSusu {
 
         // 9. Update circle deadline for next cycle
         circle.deadline_timestamp = current_time + circle.cycle_duration;
+        circle.contribution_bitmap |= 1 << member.index;
         env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
-
-        // 10. Mark as Paid in the old format for backward compatibility
-        env.storage().instance().set(&DataKey::Deposit(circle_id, user), &true);
     }
 }
 
@@ -320,7 +325,7 @@ mod fuzz_tests {
             match result {
                 Ok(_) => {
                     // Deposit succeeded
-                    println!("G£ô Amount {} succeeded", amount);
+                    println!("Gï¿½ï¿½ Amount {} succeeded", amount);
                 }
                 Err(e) => {
                     let error_msg = e.downcast::<String>().unwrap();
@@ -328,7 +333,7 @@ mod fuzz_tests {
                     assert!(error_msg.contains("insufficient balance") || 
                            error_msg.contains("underflow") ||
                            error_msg.contains("overflow"));
-                    println!("G£ô Amount {} failed with expected error: {}", amount, error_msg);
+                    println!("Gï¿½ï¿½ Amount {} failed with expected error: {}", amount, error_msg);
                 }
             }
         }
@@ -347,8 +352,8 @@ mod fuzz_tests {
         // Test boundary conditions for max_members
         let boundary_tests = vec![
             (1, "Minimum members"),
-            (u16::MAX, "Maximum members"),
-            (100, "Typical circle size"),
+            (64, "Maximum members"),
+            (50, "Typical circle size"),
         ];
 
         for (max_members, description) in boundary_tests {
@@ -375,7 +380,7 @@ mod fuzz_tests {
                 assert!(result.is_ok(), "Deposit failed for {} with max_members {}: {:?}", description, max_members, result);
             }
             
-            println!("G£ô Boundary test passed: {} (max_members: {})", description, max_members);
+            println!("Gï¿½ï¿½ Boundary test passed: {} (max_members: {})", description, max_members);
         }
     }
 
@@ -417,7 +422,7 @@ mod fuzz_tests {
             assert!(result.is_ok(), "Concurrent deposit test failed: {:?}", result);
         }
         
-        println!("G£ô Concurrent deposits test passed");
+        println!("Gï¿½ï¿½ Concurrent deposits test passed");
     }
 
     #[test]
@@ -468,10 +473,12 @@ mod fuzz_tests {
         // Verify member was marked as having contributed
         let member_key = DataKey::Member(user.clone());
         let member: Member = env.storage().instance().get(&member_key).unwrap();
-        assert!(member.has_contributed);
+        
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+        assert!(circle.contribution_bitmap & (1 << member.index) != 0);
         assert_eq!(member.contribution_count, 1);
 
-        println!("G£ô Late penalty mechanism test passed - 1% penalty correctly routed to Group Reserve");
+        println!("Gï¿½ï¿½ Late penalty mechanism test passed - 1% penalty correctly routed to Group Reserve");
     }
 
     #[test]
@@ -516,6 +523,6 @@ mod fuzz_tests {
         let final_reserve: u64 = env.storage().instance().get(&DataKey::GroupReserve).unwrap_or(0);
         assert_eq!(final_reserve, 0, "Group Reserve should have 0 tokens for on-time deposit");
 
-        println!("G£ô On-time deposit test passed - no penalty applied");
+        println!("Gï¿½ï¿½ On-time deposit test passed - no penalty applied");
     }
 }
