@@ -43,6 +43,9 @@ pub struct CircleInfo {
     pub insurance_balance: u64,
     pub insurance_fee_bps: u32,
     pub is_insurance_used: bool,
+    pub late_fee_bps: u32,
+    pub proposed_late_fee_bps: u32,
+    pub proposal_votes_bitmap: u64,
 }
 
 // --- CONTRACT TRAIT ---
@@ -62,6 +65,12 @@ pub trait SoroSusuTrait {
 
     // Trigger insurance to cover a default
     fn trigger_insurance_coverage(env: Env, caller: Address, circle_id: u64, member: Address);
+
+    // Propose a change to the late fee penalty
+    fn propose_penalty_change(env: Env, user: Address, circle_id: u64, new_bps: u32);
+
+    // Vote on the current proposal
+    fn vote_penalty_change(env: Env, user: Address, circle_id: u64);
 }
 
 // --- IMPLEMENTATION ---
@@ -113,6 +122,9 @@ impl SoroSusuTrait for SoroSusu {
             insurance_balance: 0,
             insurance_fee_bps,
             is_insurance_used: false,
+            late_fee_bps: 100, // Default 1%
+            proposed_late_fee_bps: 0,
+            proposal_votes_bitmap: 0,
         };
 
         // 4. Save the Circle and the new Count
@@ -182,8 +194,8 @@ impl SoroSusuTrait for SoroSusu {
         let mut penalty_amount = 0u64;
 
         if current_time > circle.deadline_timestamp {
-            // Calculate 1% penalty
-            penalty_amount = circle.contribution_amount / 100; // 1% penalty
+            // Calculate penalty based on dynamic rate
+            penalty_amount = (circle.contribution_amount * circle.late_fee_bps as u64) / 10000;
             
             // Update Group Reserve balance
             let mut reserve_balance: u64 = env.storage().instance().get(&DataKey::GroupReserve).unwrap_or(0);
@@ -249,6 +261,60 @@ impl SoroSusuTrait for SoroSusu {
         circle.contribution_bitmap |= 1 << member_info.index;
         circle.insurance_balance -= circle.contribution_amount;
         circle.is_insurance_used = true;
+
+        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+    }
+
+    fn propose_penalty_change(env: Env, user: Address, circle_id: u64, new_bps: u32) {
+        user.require_auth();
+        
+        let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+        
+        // Check if user is a member
+        let member_key = DataKey::Member(user.clone());
+        let member: Member = env.storage().instance().get(&member_key).expect("User is not a member");
+
+        if new_bps > 10000 {
+            panic!("Penalty cannot exceed 100%");
+        }
+
+        // Set proposal
+        circle.proposed_late_fee_bps = new_bps;
+        circle.proposal_votes_bitmap = 0;
+        
+        // Auto-vote for proposer
+        circle.proposal_votes_bitmap |= 1 << member.index;
+
+        // Check for immediate majority (e.g. 1 member circle)
+        if circle.proposal_votes_bitmap.count_ones() > (circle.member_count as u32 / 2) {
+            circle.late_fee_bps = circle.proposed_late_fee_bps;
+            circle.proposed_late_fee_bps = 0;
+            circle.proposal_votes_bitmap = 0;
+        }
+
+        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+    }
+
+    fn vote_penalty_change(env: Env, user: Address, circle_id: u64) {
+        user.require_auth();
+
+        let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+        
+        // Check if user is a member
+        let member_key = DataKey::Member(user.clone());
+        let member: Member = env.storage().instance().get(&member_key).expect("User is not a member");
+
+        if circle.proposed_late_fee_bps == 0 {
+            panic!("No active proposal");
+        }
+
+        circle.proposal_votes_bitmap |= 1 << member.index;
+
+        if circle.proposal_votes_bitmap.count_ones() > (circle.member_count as u32 / 2) {
+            circle.late_fee_bps = circle.proposed_late_fee_bps;
+            circle.proposed_late_fee_bps = 0;
+            circle.proposal_votes_bitmap = 0;
+        }
 
         env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
     }
@@ -636,5 +702,49 @@ mod fuzz_tests {
         assert!(circle_after.is_insurance_used);
         assert_eq!(circle_after.insurance_balance, 0);
         assert!(circle_after.contribution_bitmap & (1 << member2.index) != 0);
+    }
+
+    #[test]
+    fn test_governance_penalty_change() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let user1 = Address::generate(&env);
+        let user2 = Address::generate(&env);
+        let user3 = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        SoroSusuTrait::init(env.clone(), admin.clone());
+
+        let circle_id = SoroSusuTrait::create_circle(
+            env.clone(),
+            creator.clone(),
+            1000,
+            5,
+            token.clone(),
+            604800,
+            0,
+        );
+
+        SoroSusuTrait::join_circle(env.clone(), user1.clone(), circle_id);
+        SoroSusuTrait::join_circle(env.clone(), user2.clone(), circle_id);
+        SoroSusuTrait::join_circle(env.clone(), user3.clone(), circle_id);
+
+        env.mock_all_auths();
+
+        // Default is 100 bps (1%)
+        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+        assert_eq!(circle.late_fee_bps, 100);
+
+        // User 1 proposes 5% (500 bps)
+        SoroSusuTrait::propose_penalty_change(env.clone(), user1.clone(), circle_id, 500);
+
+        // User 2 votes
+        SoroSusuTrait::vote_penalty_change(env.clone(), user2.clone(), circle_id);
+
+        // Should pass (2 out of 3 votes)
+        let circle_after: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+        assert_eq!(circle_after.late_fee_bps, 500);
+        assert_eq!(circle_after.proposed_late_fee_bps, 0);
     }
 }
