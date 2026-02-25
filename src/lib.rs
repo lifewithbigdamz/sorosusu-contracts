@@ -12,18 +12,7 @@ pub enum DataKey {
     CircleCount,
     // New: Tracks if a user has paid for a specific circle (CircleID, UserAddress)
     Deposit(u64, Address),
-    // New: Tracks pending exits (CircleID, MemberAddress)
-    PendingExit(u64, Address),
-    // New: Tracks Group Reserve balance for penalties
-    GroupReserve,
-}
 
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub enum MemberStatus {
-    Active,
-    AwaitingReplacement,
-    Ejected,
 }
 
 #[contracttype]
@@ -33,9 +22,7 @@ pub struct Member {
     pub index: u32,
     pub contribution_count: u32,
     pub last_contribution_time: u64,
-    pub status: MemberStatus,
-    pub total_contributed: u64,
-}
+
 
 #[contracttype]
 #[derive(Clone)]
@@ -59,6 +46,7 @@ pub struct CircleInfo {
     pub proposed_late_fee_bps: u32,
     pub proposal_votes_bitmap: u64,
     pub nft_contract: Address,
+
 }
 
 // --- CONTRACT TRAIT ---
@@ -87,12 +75,7 @@ pub trait SoroSusuTrait {
 
     // Eject a member (burns NFT)
     fn eject_member(env: Env, caller: Address, circle_id: u64, member: Address);
-    
-    // Request graceful exit from the circle
-    fn request_exit(env: Env, user: Address, circle_id: u64);
-    
-    // Fill a vacancy left by a member who requested graceful exit
-    fn fill_vacancy(env: Env, new_member: Address, circle_id: u64, exiting_member_address: Address);
+
 }
 
 #[contractclient(name = "SusuNftClient")]
@@ -154,6 +137,7 @@ impl SoroSusuTrait for SoroSusu {
             proposed_late_fee_bps: 0,
             proposal_votes_bitmap: 0,
             nft_contract,
+
         };
 
         // 4. Save the Circle and the new Count
@@ -193,8 +177,7 @@ impl SoroSusuTrait for SoroSusu {
             index: circle.member_count as u32,
             contribution_count: 0,
             last_contribution_time: 0,
-            status: MemberStatus::Active,
-            total_contributed: 0,
+
         };
         
         // 6. Store the member and update circle count
@@ -223,8 +206,7 @@ impl SoroSusuTrait for SoroSusu {
         let mut member: Member = env.storage().instance().get(&member_key)
             .unwrap_or_else(|| panic!("User is not a member of this circle"));
 
-        if member.status != MemberStatus::Active {
-            panic!("Member is not active");
+
         }
 
         // 4. Create the Token Client
@@ -261,7 +243,7 @@ impl SoroSusuTrait for SoroSusu {
         // 7. Update member contribution info
         member.contribution_count += 1;
         member.last_contribution_time = current_time;
-        member.total_contributed += circle.contribution_amount;
+
         
         // 8. Save updated member info
         env.storage().instance().set(&member_key, &member);
@@ -295,8 +277,7 @@ impl SoroSusuTrait for SoroSusu {
         let member_key = DataKey::Member(member.clone());
         let member_info: Member = env.storage().instance().get(&member_key).unwrap();
 
-        if member_info.status != MemberStatus::Active {
-            panic!("Member is not active");
+
         }
 
         // Mark member as contributed in the bitmap
@@ -354,8 +335,7 @@ impl SoroSusuTrait for SoroSusu {
         let member_key = DataKey::Member(user.clone());
         let member: Member = env.storage().instance().get(&member_key).expect("User is not a member");
 
-        if member.status != MemberStatus::Active {
-            panic!("Member is not active");
+
         }
 
         if circle.proposed_late_fee_bps == 0 {
@@ -386,12 +366,7 @@ impl SoroSusuTrait for SoroSusu {
         let member_key = DataKey::Member(member.clone());
         let mut member_info: Member = env.storage().instance().get(&member_key).expect("Member not found");
 
-        if member_info.status != MemberStatus::Active {
-            panic!("Member already ejected");
-        }
 
-        // Mark as ejected
-        member_info.status = MemberStatus::Ejected;
         env.storage().instance().set(&member_key, &member_info);
 
         // Burn NFT
@@ -400,102 +375,7 @@ impl SoroSusuTrait for SoroSusu {
         client.burn(&member, &token_id);
     }
 
-    fn request_exit(env: Env, user: Address, circle_id: u64) {
-        user.require_auth();
-
-        // Get the circle and member information
-        let circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
-            .unwrap_or_else(|| panic!("Circle not found"));
-
-        let member_key = DataKey::Member(user.clone());
-        let mut member: Member = env.storage().instance().get(&member_key)
-            .unwrap_or_else(|| panic!("User is not a member of this circle"));
-
-        // Check if member is active and can request exit
-        if member.status != MemberStatus::Active {
-            panic!("Member cannot request exit in current state");
-        }
-
-        // Change member status to AwaitingReplacement
-        member.status = MemberStatus::AwaitingReplacement;
-        env.storage().instance().set(&member_key, &member);
-
-        // Store the pending exit request
-        let pending_exit_key = DataKey::PendingExit(circle_id, user.clone());
-        env.storage().instance().set(&pending_exit_key, &true);
-
-        // Note: We keep the member's position in the queue locked until fill_vacancy is called
-    }
-
-    fn fill_vacancy(env: Env, new_member: Address, circle_id: u64, exiting_member_address: Address) {
-        new_member.require_auth();
-
-        // Get the circle information
-        let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id))
-            .unwrap_or_else(|| panic!("Circle not found"));
-
-        // Verify there's a pending exit for the specified member
-        let pending_exit_key = DataKey::PendingExit(circle_id, exiting_member_address.clone());
-        if !env.storage().instance().has(&pending_exit_key) {
-            panic!("No pending exit found for specified member");
-        }
-
-        // Get the exiting member's information
-        let exiting_member_key = DataKey::Member(exiting_member_address.clone());
-        let exiting_member: Member = env.storage().instance().get(&exiting_member_key)
-            .unwrap_or_else(|| panic!("Exiting member not found"));
-
-        if exiting_member.status != MemberStatus::AwaitingReplacement {
-            panic!("Exiting member is not in AwaitingReplacement state");
-        }
-
-        // Check if new member is already in any circle
-        let new_member_key = DataKey::Member(new_member.clone());
-        if env.storage().instance().has(&new_member_key) {
-            panic!("New member is already part of a circle");
-        }
-
-        // Calculate refund amount (pro-rata settlement: return only principal contributions)
-        let refund_amount = exiting_member.total_contributed;
-
-        if refund_amount > 0 {
-            // Transfer refund to exiting member
-            let token_client = token::Client::new(&env, &circle.token);
-            token_client.transfer(
-                &env.current_contract_address(),
-                &exiting_member_address,
-                &refund_amount
-            );
-        }
-
-        // Create new member with the same index as the exiting member
-        let replacement_member = Member {
-            address: new_member.clone(),
-            index: exiting_member.index, // Inherit the position in queue
-            contribution_count: 0,
-            last_contribution_time: 0,
-            status: MemberStatus::Active,
-            total_contributed: 0,
-        };
-
-        // Store the new member
-        env.storage().instance().set(&new_member_key, &replacement_member);
-
-        // Update exiting member status to Ejected (effectively removed)
-        let mut updated_exiting_member = exiting_member;
-        updated_exiting_member.status = MemberStatus::Ejected;
-        env.storage().instance().set(&exiting_member_key, &updated_exiting_member);
-
-        // Remove the pending exit record
-        env.storage().instance().remove(&pending_exit_key);
-
-        // Burn the exiting member's NFT
-        let token_id = (circle_id as u128) << 64 | (exiting_member.index as u128);
-        let nft_client = SusuNftClient::new(&env, &circle.nft_contract);
-        nft_client.burn(&exiting_member_address, &token_id);
-
-        // Mint new NFT for the replacement member
-        nft_client.mint(&new_member, &token_id);
+<
     }
 }
 
@@ -955,6 +835,7 @@ mod fuzz_tests {
     }
 
     #[test]
+
     fn test_nft_membership() {
         let env = Env::default();
         let admin = Address::generate(&env);
