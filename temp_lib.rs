@@ -40,6 +40,9 @@ pub struct CircleInfo {
     pub cycle_duration: u64, // Duration of each payment cycle in seconds
     pub contribution_bitmap: u64,
     pub payout_bitmap: u64,
+    pub insurance_balance: u64,
+    pub insurance_fee_bps: u32,
+    pub is_insurance_used: bool,
 }
 
 // --- CONTRACT TRAIT ---
@@ -49,13 +52,16 @@ pub trait SoroSusuTrait {
     fn init(env: Env, admin: Address);
     
     // Create a new savings circle
-    fn create_circle(env: Env, creator: Address, amount: u64, max_members: u16, token: Address, cycle_duration: u64) -> u64;
+    fn create_circle(env: Env, creator: Address, amount: u64, max_members: u16, token: Address, cycle_duration: u64, insurance_fee_bps: u32) -> u64;
 
     // Join an existing circle
     fn join_circle(env: Env, user: Address, circle_id: u64);
 
     // Make a deposit (Pay your weekly/monthly due)
     fn deposit(env: Env, user: Address, circle_id: u64);
+
+    // Trigger insurance to cover a default
+    fn trigger_insurance_coverage(env: Env, caller: Address, circle_id: u64, member: Address);
 }
 
 // --- IMPLEMENTATION ---
@@ -74,7 +80,7 @@ impl SoroSusuTrait for SoroSusu {
         env.storage().instance().set(&DataKey::Admin, &admin);
     }
 
-    fn create_circle(env: Env, creator: Address, amount: u64, max_members: u16, token: Address, cycle_duration: u64) -> u64 {
+    fn create_circle(env: Env, creator: Address, amount: u64, max_members: u16, token: Address, cycle_duration: u64, insurance_fee_bps: u32) -> u64 {
         // 1. Get the current Circle Count
         let mut circle_count: u64 = env.storage().instance().get(&DataKey::CircleCount).unwrap_or(0);
         
@@ -83,6 +89,10 @@ impl SoroSusuTrait for SoroSusu {
 
         if max_members > 64 {
             panic!("Max members cannot exceed 64 for optimization");
+        }
+
+        if insurance_fee_bps > 10000 {
+            panic!("Insurance fee cannot exceed 100%");
         }
 
         // 3. Create the Circle Data Struct
@@ -100,6 +110,9 @@ impl SoroSusuTrait for SoroSusu {
             cycle_duration,
             contribution_bitmap: 0,
             payout_bitmap: 0,
+            insurance_balance: 0,
+            insurance_fee_bps,
+            is_insurance_used: false,
         };
 
         // 4. Save the Circle and the new Count
@@ -178,12 +191,19 @@ impl SoroSusuTrait for SoroSusu {
             env.storage().instance().set(&DataKey::GroupReserve, &reserve_balance);
         }
 
-        // 6. Transfer the full amount from user
+        // 6. Calculate Insurance Fee and Transfer the full amount from user
+        let insurance_fee = ((circle.contribution_amount as u128 * circle.insurance_fee_bps as u128) / 10000) as u64;
+        let total_amount = circle.contribution_amount + insurance_fee;
+
         client.transfer(
             &user, 
             &env.current_contract_address(), 
-            &circle.contribution_amount
+            &total_amount
         );
+
+        if insurance_fee > 0 {
+            circle.insurance_balance += insurance_fee;
+        }
 
         // 7. Update member contribution info
         member.contribution_count += 1;
@@ -195,6 +215,41 @@ impl SoroSusuTrait for SoroSusu {
         // 9. Update circle deadline for next cycle
         circle.deadline_timestamp = current_time + circle.cycle_duration;
         circle.contribution_bitmap |= 1 << member.index;
+        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+    }
+
+    fn trigger_insurance_coverage(env: Env, caller: Address, circle_id: u64, member: Address) {
+        caller.require_auth();
+
+        let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+
+        // Only creator can trigger insurance
+        if caller != circle.creator {
+            panic!("Unauthorized: Only creator can trigger insurance");
+        }
+
+        // Check if insurance was already used this cycle
+        if circle.is_insurance_used {
+            panic!("Insurance already used this cycle");
+        }
+
+        // Check if there is enough balance
+        if circle.insurance_balance < circle.contribution_amount {
+            panic!("Insufficient insurance balance");
+        }
+
+        let member_key = DataKey::Member(member.clone());
+        let member_info: Member = env.storage().instance().get(&member_key).unwrap();
+
+        // Mark member as contributed in the bitmap
+        if (circle.contribution_bitmap & (1 << member_info.index)) != 0 {
+            panic!("Member already contributed");
+        }
+
+        circle.contribution_bitmap |= 1 << member_info.index;
+        circle.insurance_balance -= circle.contribution_amount;
+        circle.is_insurance_used = true;
+
         env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
     }
 }
@@ -232,6 +287,7 @@ mod fuzz_tests {
             10,
             token.clone(),
             604800, // 1 week in seconds
+            0,
         );
 
         let user1 = Address::generate(&env);
@@ -267,6 +323,7 @@ mod fuzz_tests {
             10,
             token.clone(),
             604800, // 1 week in seconds
+            0,
         );
 
         let user2 = Address::generate(&env);
@@ -310,6 +367,7 @@ mod fuzz_tests {
                 10,
                 token.clone(),
                 604800, // 1 week in seconds
+                0,
             );
 
             let user = Address::generate(&env);
@@ -364,6 +422,7 @@ mod fuzz_tests {
                 max_members,
                 token.clone(),
                 604800, // 1 week in seconds
+                0,
             );
 
             // Test joining with maximum allowed members
@@ -401,6 +460,7 @@ mod fuzz_tests {
             5,
             token.clone(),
             604800, // 1 week in seconds
+            0,
         );
 
         // Create multiple users and test deposits
@@ -444,6 +504,7 @@ mod fuzz_tests {
             5,
             token.clone(),
             604800, // 1 week in seconds
+            0,
         );
 
         // User joins the circle
@@ -500,6 +561,7 @@ mod fuzz_tests {
             5,
             token.clone(),
             604800, // 1 week in seconds
+            0,
         );
 
         // User joins the circle
@@ -524,5 +586,55 @@ mod fuzz_tests {
         assert_eq!(final_reserve, 0, "Group Reserve should have 0 tokens for on-time deposit");
 
         println!("G�� On-time deposit test passed - no penalty applied");
+    }
+
+    #[test]
+    fn test_insurance_fund() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let creator = Address::generate(&env);
+        let user1 = Address::generate(&env);
+        let user2 = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        SoroSusuTrait::init(env.clone(), admin.clone());
+
+        // Create circle with 10% insurance fee (1000 bps)
+        let circle_id = SoroSusuTrait::create_circle(
+            env.clone(),
+            creator.clone(),
+            1000,
+            5,
+            token.clone(),
+            604800,
+            1000, // 10% insurance fee
+        );
+
+        SoroSusuTrait::join_circle(env.clone(), user1.clone(), circle_id);
+        SoroSusuTrait::join_circle(env.clone(), user2.clone(), circle_id);
+
+        env.mock_all_auths();
+
+        // User 1 deposits. 1000 + 100 fee. Insurance balance becomes 100.
+        SoroSusuTrait::deposit(env.clone(), user1.clone(), circle_id);
+        
+        let mut circle: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+        assert_eq!(circle.insurance_balance, 100);
+
+        // User 1 deposits 9 more times to build up insurance (simulating multiple cycles or members)
+        // In this simplified test, we just force update the balance to test triggering
+        circle.insurance_balance = 1000; 
+        env.storage().instance().set(&DataKey::Circle(circle_id), &circle);
+
+        // User 2 defaults. Creator triggers insurance.
+        SoroSusuTrait::trigger_insurance_coverage(env.clone(), creator.clone(), circle_id, user2.clone());
+
+        let circle_after: CircleInfo = env.storage().instance().get(&DataKey::Circle(circle_id)).unwrap();
+        let member2_key = DataKey::Member(user2.clone());
+        let member2: Member = env.storage().instance().get(&member2_key).unwrap();
+
+        assert!(circle_after.is_insurance_used);
+        assert_eq!(circle_after.insurance_balance, 0);
+        assert!(circle_after.contribution_bitmap & (1 << member2.index) != 0);
     }
 }
